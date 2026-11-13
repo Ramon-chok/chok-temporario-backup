@@ -1,0 +1,1 @@
+(arquivo movido para docs; pode ser removido se não for mais necessário)
