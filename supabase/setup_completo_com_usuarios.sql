@@ -1,0 +1,473 @@
+-- ==============================================================================
+-- SETUP COMPLETO: schema + usuarios (rodar uma unica vez no SQL Editor)
+-- ATENCAO: a parte de usuarios APAGA e recria public.usuarios.
+-- ==============================================================================
+
+-- ==============================================================================
+-- BLUEFLOW - SCHEMA COMPLETO (Supabase projeto bqcyefcndtjhhrcggqad)
+-- ==============================================================================
+-- Consolida tudo que o app usa: tabelas, indices, RLS, RPCs, grants e bucket.
+-- Idempotente: pode ser executado mais de uma vez.
+-- Derivado de: src/types/supabase.ts, chamadas .from()/.rpc()/.storage do codigo
+-- e dos arquivos legados em supabase/*.sql e sql/supabase-setup.sql.
+--
+-- MODELO DE ACESSO
+--  * O app NAO usa Supabase Auth: o login e proprio (tabela usuarios + cookie).
+--    Por isso, no navegador, todas as consultas chegam como role "anon".
+--  * As rotas /api/* usam a service_role (ignora RLS).
+--  * Tabelas lidas direto no navegador (anon): ped_vda, chamados,
+--    chamado_mensagens, notificacoes -> recebem policy de SELECT para anon.
+--  * Tabelas sensiveis (usuarios, config, notas_vendedor, page_logs,
+--    it_pedv, excel_metadata) ficam com RLS ligado e SEM policy para anon
+--    (so a service_role acessa).
+-- ==============================================================================
+
+-- ------------------------------------------------------------------------------
+-- 1. usuarios
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.usuarios (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  usuario     TEXT NOT NULL UNIQUE,
+  senha_hash  TEXT,
+  perfil      TEXT NOT NULL CHECK (perfil IN ('vendedor', 'supervisor', 'gerencia', 'admin')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE public.usuarios ENABLE ROW LEVEL SECURITY;
+
+-- ------------------------------------------------------------------------------
+-- 2. config (chave/valor - ex.: ultima_atualizacao)
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.config (
+  key    TEXT PRIMARY KEY,
+  value  TEXT
+);
+ALTER TABLE public.config ENABLE ROW LEVEL SECURITY;
+
+-- ------------------------------------------------------------------------------
+-- 3. ped_vda (faturamento - cabecalho) e it_pedv (faturamento - itens)
+--    Populadas por /api/import-local a partir do dados_app.xlsm
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.ped_vda (
+  nu_ped   BIGINT PRIMARY KEY,
+  dt_ped   DATE NOT NULL,
+  total    NUMERIC NOT NULL DEFAULT 0,
+  cd_vend  TEXT NOT NULL,
+  nm_vend  TEXT NOT NULL,
+  cd_clie  TEXT NOT NULL,
+  nm_clie  TEXT NOT NULL,
+  cd_cat   TEXT,
+  nm_cat   TEXT,
+  cd_cid   TEXT,
+  nm_cid   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ped_vda_dt_ped  ON public.ped_vda (dt_ped);
+CREATE INDEX IF NOT EXISTS idx_ped_vda_cd_vend ON public.ped_vda (cd_vend);
+ALTER TABLE public.ped_vda ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS public.it_pedv (
+  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nu_ped     BIGINT NOT NULL,
+  nu_item    BIGINT NOT NULL,
+  qtd        NUMERIC NOT NULL,
+  vl_unit    NUMERIC NOT NULL,
+  vl_venda   NUMERIC NOT NULL,
+  vl_mg_brt  NUMERIC DEFAULT 0,   -- margem bruta + financeiro (coluna "mgbr + fin$")
+  cd_prod    TEXT,
+  nm_prod    TEXT
+);
+-- Sem FK para ped_vda de proposito: o import apaga/reinsere ped_vda e it_pedv em lotes.
+CREATE INDEX IF NOT EXISTS idx_it_pedv_nu_ped ON public.it_pedv (nu_ped);
+ALTER TABLE public.it_pedv ENABLE ROW LEVEL SECURITY;
+
+-- ------------------------------------------------------------------------------
+-- 4. chamados e chamado_mensagens
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.chamados (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nome          TEXT,
+  codigo        TEXT NOT NULL,                 -- usuario que abriu o chamado
+  descricao     TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'aberto', -- aberto | em andamento | encerrado
+  data_criacao  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_chamados_status       ON public.chamados (status);
+CREATE INDEX IF NOT EXISTS idx_chamados_data_criacao ON public.chamados (data_criacao DESC);
+ALTER TABLE public.chamados ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS public.chamado_mensagens (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  chamado_id    UUID NOT NULL REFERENCES public.chamados(id) ON DELETE CASCADE,
+  autor_codigo  TEXT NOT NULL,
+  autor_perfil  TEXT NOT NULL,
+  mensagem      TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_chamado_mensagens_chamado_id ON public.chamado_mensagens (chamado_id);
+CREATE INDEX IF NOT EXISTS idx_chamado_mensagens_created_at ON public.chamado_mensagens (created_at);
+ALTER TABLE public.chamado_mensagens ENABLE ROW LEVEL SECURITY;
+
+-- ------------------------------------------------------------------------------
+-- 5. notificacoes (user_id = nome de usuario, nao uuid)
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.notificacoes (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     TEXT NOT NULL,
+  chamado_id  UUID,
+  mensagem    TEXT NOT NULL,
+  status      VARCHAR(10) NOT NULL DEFAULT 'nao_lida',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notificacoes_user_id    ON public.notificacoes (user_id);
+CREATE INDEX IF NOT EXISTS idx_notificacoes_chamado_id ON public.notificacoes (chamado_id);
+ALTER TABLE public.notificacoes ENABLE ROW LEVEL SECURITY;
+
+-- ------------------------------------------------------------------------------
+-- 6. notas_vendedor (notas pessoais, reset mensal)
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.notas_vendedor (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_codigo TEXT NOT NULL,
+  titulo         TEXT NOT NULL,
+  conteudo       TEXT NOT NULL,
+  criado_em      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  atualizado_em  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  mes_criacao    INTEGER NOT NULL DEFAULT EXTRACT(MONTH FROM NOW()),
+  ano_criacao    INTEGER NOT NULL DEFAULT EXTRACT(YEAR FROM NOW())
+);
+CREATE INDEX IF NOT EXISTS idx_notas_usuario ON public.notas_vendedor (usuario_codigo);
+CREATE INDEX IF NOT EXISTS idx_notas_data    ON public.notas_vendedor (criado_em DESC);
+CREATE INDEX IF NOT EXISTS idx_notas_mes_ano ON public.notas_vendedor (mes_criacao, ano_criacao);
+ALTER TABLE public.notas_vendedor ENABLE ROW LEVEL SECURITY;
+-- (As policies antigas comparavam usuarios.id com auth.uid(); como o app nao usa
+--  Supabase Auth e usuarios.id e numerico, elas nunca funcionariam. O acesso e
+--  feito exclusivamente pela API com service_role.)
+
+CREATE OR REPLACE FUNCTION public.atualizar_timestamp_nota()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.atualizado_em = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_atualizar_nota ON public.notas_vendedor;
+CREATE TRIGGER trigger_atualizar_nota
+  BEFORE UPDATE ON public.notas_vendedor
+  FOR EACH ROW EXECUTE FUNCTION public.atualizar_timestamp_nota();
+
+CREATE OR REPLACE FUNCTION public.limpar_notas_mes_anterior()
+RETURNS TRIGGER AS $$
+DECLARE
+  mes_atual INTEGER := EXTRACT(MONTH FROM NOW());
+  ano_atual INTEGER := EXTRACT(YEAR FROM NOW());
+BEGIN
+  DELETE FROM public.notas_vendedor
+  WHERE mes_criacao != mes_atual OR ano_criacao != ano_atual;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_limpar_notas_antigas ON public.notas_vendedor;
+CREATE TRIGGER trigger_limpar_notas_antigas
+  AFTER INSERT ON public.notas_vendedor
+  FOR EACH ROW EXECUTE FUNCTION public.limpar_notas_mes_anterior();
+
+-- ------------------------------------------------------------------------------
+-- 7. page_logs (rastreamento de paginas; lido/escrito pela API)
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.page_logs (
+  id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id          TEXT,
+  user_email       TEXT,
+  page_path        TEXT NOT NULL,
+  page_name        TEXT NOT NULL,
+  session_id       TEXT NOT NULL,
+  duration_seconds INTEGER NOT NULL DEFAULT 0 CHECK (duration_seconds >= 0),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_page_logs_created_at ON public.page_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_page_logs_page_path  ON public.page_logs (page_path);
+CREATE INDEX IF NOT EXISTS idx_page_logs_user_id    ON public.page_logs (user_id);
+ALTER TABLE public.page_logs ENABLE ROW LEVEL SECURITY;
+
+-- ------------------------------------------------------------------------------
+-- 8. excel_metadata (metadata do ultimo upload de Excel)
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.excel_metadata (
+  id          INTEGER PRIMARY KEY,
+  filename    TEXT NOT NULL,
+  uploaded_at BIGINT NOT NULL,
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE public.excel_metadata ENABLE ROW LEVEL SECURITY;
+INSERT INTO public.excel_metadata (id, filename, uploaded_at, updated_at)
+VALUES (1, 'dados_app.xlsx', (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT, NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- ------------------------------------------------------------------------------
+-- 9. RPCs usadas pelo app (useQueries.ts / import-local)
+--    Versao final: margem real via it_pedv.vl_mg_brt + filtro por vendedor.
+-- ------------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS public.get_kpis(DATE, DATE);
+DROP FUNCTION IF EXISTS public.get_kpis(DATE, DATE, TEXT);
+CREATE OR REPLACE FUNCTION public.get_kpis(
+  start_date DATE DEFAULT NULL,
+  end_date DATE DEFAULT NULL,
+  cd_vend_filter TEXT DEFAULT NULL
+)
+RETURNS TABLE(
+  "totalRevenue" NUMERIC,
+  "totalProfit" NUMERIC,
+  "profitMargin" NUMERIC,
+  "averageTicket" NUMERIC,
+  "totalOrders" BIGINT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  RETURN QUERY
+  WITH pedidos AS (
+    SELECT p.nu_ped, p.total
+    FROM ped_vda p
+    WHERE (start_date IS NULL OR p.dt_ped >= start_date)
+      AND (end_date IS NULL OR p.dt_ped <= end_date)
+      AND (cd_vend_filter IS NULL OR p.cd_vend = cd_vend_filter)
+  ),
+  itens AS (
+    SELECT COALESCE(SUM(i.vl_mg_brt), 0) AS lucro,
+           COALESCE(SUM(i.vl_venda), 0)  AS venda
+    FROM it_pedv i
+    INNER JOIN pedidos p ON p.nu_ped = i.nu_ped
+  )
+  SELECT
+    COALESCE((SELECT SUM(total) FROM pedidos), 0)::NUMERIC,
+    (SELECT lucro FROM itens)::NUMERIC,
+    CASE WHEN (SELECT venda FROM itens) > 0
+         THEN (SELECT lucro FROM itens) / (SELECT venda FROM itens) * 100
+         ELSE 0 END::NUMERIC,
+    CASE WHEN (SELECT COUNT(*) FROM pedidos) > 0
+         THEN COALESCE((SELECT SUM(total) FROM pedidos), 0) / (SELECT COUNT(*) FROM pedidos)
+         ELSE 0 END::NUMERIC,
+    (SELECT COUNT(*) FROM pedidos)::BIGINT;
+END;
+$$;
+
+DROP FUNCTION IF EXISTS public.get_top_clients(DATE, DATE);
+DROP FUNCTION IF EXISTS public.get_top_clients(DATE, DATE, TEXT);
+CREATE OR REPLACE FUNCTION public.get_top_clients(
+  start_date DATE DEFAULT NULL,
+  end_date DATE DEFAULT NULL,
+  cd_vend_filter TEXT DEFAULT NULL
+)
+RETURNS TABLE(
+  "clientName" TEXT,
+  "totalPurchases" BIGINT,
+  "totalAmount" NUMERIC,
+  "lastPurchaseDate" TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    p.nm_clie::TEXT,
+    COUNT(*)::BIGINT,
+    COALESCE(SUM(p.total), 0)::NUMERIC,
+    MAX(p.dt_ped)::TEXT
+  FROM ped_vda p
+  WHERE (start_date IS NULL OR p.dt_ped >= start_date)
+    AND (end_date IS NULL OR p.dt_ped <= end_date)
+    AND (cd_vend_filter IS NULL OR p.cd_vend = cd_vend_filter)
+  GROUP BY p.nm_clie
+  ORDER BY 3 DESC
+  LIMIT 10;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.get_kpis(DATE, DATE, TEXT)        TO anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.get_top_clients(DATE, DATE, TEXT) TO anon, authenticated, service_role;
+
+-- ------------------------------------------------------------------------------
+-- 10. Policies para leitura direta pelo navegador (role anon)
+--     Replica o comportamento anterior do app. Veja observacao de seguranca no
+--     final do arquivo.
+-- ------------------------------------------------------------------------------
+GRANT SELECT ON public.ped_vda, public.chamados, public.chamado_mensagens, public.notificacoes
+  TO anon, authenticated;
+
+DROP POLICY IF EXISTS "anon_select_ped_vda" ON public.ped_vda;
+CREATE POLICY "anon_select_ped_vda" ON public.ped_vda
+  FOR SELECT TO anon, authenticated USING (true);
+
+DROP POLICY IF EXISTS "anon_select_chamados" ON public.chamados;
+CREATE POLICY "anon_select_chamados" ON public.chamados
+  FOR SELECT TO anon, authenticated USING (true);
+
+DROP POLICY IF EXISTS "anon_select_chamado_mensagens" ON public.chamado_mensagens;
+CREATE POLICY "anon_select_chamado_mensagens" ON public.chamado_mensagens
+  FOR SELECT TO anon, authenticated USING (true);
+
+DROP POLICY IF EXISTS "anon_select_notificacoes" ON public.notificacoes;
+CREATE POLICY "anon_select_notificacoes" ON public.notificacoes
+  FOR SELECT TO anon, authenticated USING (true);
+
+-- ------------------------------------------------------------------------------
+-- 11. Storage: bucket "excel-files" (privado; acessado via service_role)
+-- ------------------------------------------------------------------------------
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('excel-files', 'excel-files', false)
+ON CONFLICT (id) DO NOTHING;
+
+-- ------------------------------------------------------------------------------
+-- 12. Dados iniciais minimos
+--     Os usuarios reais sao importados por scripts/importar_usuarios_excel.js
+--     (a partir de usuarios.xlsx). Nenhum usuario com senha fraca e criado aqui.
+-- ------------------------------------------------------------------------------
+
+-- ==============================================================================
+-- OBSERVACAO DE SEGURANCA
+-- ped_vda, chamados, chamado_mensagens e notificacoes ficam legiveis por qualquer
+-- portador da publishable/anon key, pois o frontend as consulta direto. Para
+-- fechar isso, mover essas leituras para rotas /api (service_role) e remover as
+-- policies "anon_*" acima.
+-- ==============================================================================
+
+NOTIFY pgrst, 'reload schema';
+
+-- ==============================================================================
+-- USUARIOS (seed)
+-- ==============================================================================
+-- Recria todos os usuarios a partir do user.txt (apaga os existentes e insere de novo).
+-- Senhas gravadas em hash scrypt: o login continua com as senhas do user.txt.
+BEGIN;
+
+DELETE FROM public.usuarios;
+
+INSERT INTO public.usuarios (usuario, perfil, senha_hash) VALUES
+  ('799', 'vendedor', 'scrypt$16384$8$1$774z37YxzSPx0N609SUAlg$gPeB7XMYJIn_JrMDlxicveaYO4EOyfQawv2cCojuZV08Vy4f8lp0RhOpk0nn3aOsf6-oXNXFwAYRZYXO5gOXNg'),
+  ('1216', 'vendedor', 'scrypt$16384$8$1$LCbqM4-MvJTpnSaG7Aci2Q$Gcn0-kDBtCTcbgGIyTIxnncs4DIj83K7QREvPQz48gi8DHJXgghgImNcRfYujGQIrGYpF2-DjDIZW4uyun4ytw'),
+  ('1230', 'vendedor', 'scrypt$16384$8$1$fdUrrTe0Emms5MMCQWg3xg$5ebDaU5mMqJm46YGJL1LKfV4BBd3yc8z-UhLhmSY_GvKub5-uvWtvFCZJsBy90sdKos_pOnsypo8RVPVsbjVmw'),
+  ('1242', 'vendedor', 'scrypt$16384$8$1$Ffk_HLaagj26XIeJ1Aq83Q$Yp52UeKHic35r7dMfY0C2onQi5ar_a83wijRiCoglZcsn-nV-SluMxMajzMOAjtUOBM_OhwJvGJ7IBpTBNqQiA'),
+  ('1250', 'vendedor', 'scrypt$16384$8$1$guHZPsmNnU2ILeWvKvfm0Q$fxGtvyohcpA926reWKuTFQUo3fHjHgj9OqX7jxlbq8YtqUQ1C2BmlY6ksRecy9E51ZYbBWVR9mvgpOM-2aIvfQ'),
+  ('1254', 'vendedor', 'scrypt$16384$8$1$w3JFaTdwIR9favjRm4C4lg$d2rKG9ciMZtMjgL0HahW6szRXUmoU76GtgqzJ1yLEvWQFeK2LsUEgv2vFxQX0fp-ioOohtQT86TjHE69oIjONg'),
+  ('1331', 'vendedor', 'scrypt$16384$8$1$hIE4gbL1znrfbIzzsK-euQ$tVJcWGIajDLv48KDWIBXOwfKRv9oDfNeZYx1C9t9ZcsXs-uPcuCrbTKcdlgpjd7kLDcIOUoJ-7IP45Ps2qjTWA'),
+  ('1333', 'vendedor', 'scrypt$16384$8$1$ajtsmVAUcsko76NEizmmzA$hjgbL1amZivMIBO07sTekrv4G9OddL0Dq0SK_FqG45WhX-taSnKRmpqUa4MxpAY1LJ1U9DCB8cLxzlRaGTdEtA'),
+  ('1190', 'vendedor', 'scrypt$16384$8$1$WmM4THKZtPWNDzLav17J0g$f34lgSHvF44avsY1-zRExw5rQbKjcRKyQEeFjPK3kONYyN-elJyygFLwwITu__phvuooKquix4mtI9QZuSD8mg'),
+  ('20', 'supervisor', 'scrypt$16384$8$1$prvQKEvKhIEeVpAAATLByw$Otd6ytlqziB0wc0i7Y_ARm4ztmcqUI2ZsvTbABHCVQVUw9n4fRe0Xqk7wNpmiozg_JrRBPF47C8CeHE2dTDaKg'),
+  ('923', 'vendedor', 'scrypt$16384$8$1$An2u-mnBbCuOmm4gnp5rJA$nFGvMDN7-bUPq1ybZTkncaiPNwJxH_aeD8bSxkP8wH8X3QDfvQVVPVF38y_G3z9y4TyCZRZHJ9pSPgR_JacrQg'),
+  ('1047', 'vendedor', 'scrypt$16384$8$1$T9RmmgkdCanfZT06VUlylg$S0sgXkwkt25mL84faQvBNjePN7RymnGjlUoPb3pYayfnk92W1dRHNEe1KJDHrVDceWOv8nfYjDOpx6XSHM1P3A'),
+  ('1162', 'vendedor', 'scrypt$16384$8$1$TwQ0neMenyJy-6ktznA9nQ$5F2T_NZ6A_-JQQ-lWEtqjaWQylJ667tbzLwh57xC6efkNKgX6eASPbQuhECAxNFvcXVbIac663GRG_xVNWanYw'),
+  ('1164', 'vendedor', 'scrypt$16384$8$1$hZdZtf20o1fgdkWthDeNHA$E5TMh1tTDPyr5k-gHByFiLR4xAVyQDl43rHeSjGSahfvI-VnGW_Ekf4tIrmG5b26A0m0YF-ub7szPyftuEmMHQ'),
+  ('1168', 'vendedor', 'scrypt$16384$8$1$V1xRaBdd1MdZEgvpwolIfA$NF54zpGVITcsSniCXYL4yhQMsaE0VkBdMzMwcjK6bt6JXukMtG5t_0nRLvjAAJbnB_-J1rAJ7hYsghIBD2qpig'),
+  ('1332', 'vendedor', 'scrypt$16384$8$1$An02nt5CzgBJ7cG7x3zRzw$HlsIUrjdF41QCHZcSKyn8JAaOnrJrBXqXykC3wkhaz-KYS3X5Xn4kDAH1BXEHm0WBMOsFb3KdQJCnpwR96fVSg'),
+  ('30', 'supervisor', 'scrypt$16384$8$1$lxls7npeJYGmj6mIc5OxVQ$rpd7I7yKPD3IiDy3ACymgozfchXtNJgIc4Hi3SDyi8-HPM_0zQhCUFr3RRZ4ZUTdnCICho6ae_Sdg8JpJkj1Vg'),
+  ('937', 'vendedor', 'scrypt$16384$8$1$YvNePqRjQPJB_WWciq4Z0Q$15OwDORmPqDLpBchmdbGenf5WlPmIJ_32LQzsTzNUuB67afgMqI3TBpGHdSKnN4Qs4RUwaLPJ_ddiKRwWmGc7w'),
+  ('1044', 'vendedor', 'scrypt$16384$8$1$b_Bb8U-tYp60o1-ytXZPVQ$XapiOLmI17vECy5cu_c6BE25kQjq8lDai8HL0IMmUBmEJyltTQFcaEP-rrkeruYCK9FH0WWznKYHj29GL3CDkQ'),
+  ('1194', 'vendedor', 'scrypt$16384$8$1$OjBNGo6YgPADVivdlOYAWw$44q62fO6fNImw5hgyvGeYSCfPYfxbXpN2Q3QdM0ebD1KC35K8NV1W7FWw9DZmF5gtEnLtZybn59XEZRWeQqz6A'),
+  ('1197', 'vendedor', 'scrypt$16384$8$1$7EzSGLPRHByi2XcWbxD4yQ$KQ1d0m6PdnMFxB8_DjgBRiXklPGSOr52m_QD19OYxJXa54cAca0Ptv3hfBSxKqYP4sdwFyKtrTv4vQKNLdk3mw'),
+  ('1200', 'vendedor', 'scrypt$16384$8$1$Cne9t4Xryu8Dva7XWW_plQ$TRVn9XyVicYyE-IQGFOrNtaFFVkO4VNTDZuvtL3dOWBFSYfHm35ErlfUOl5qNUjN0ilQ1FQ99aLMe5GptcM5qw'),
+  ('1222', 'vendedor', 'scrypt$16384$8$1$ZbqxmfxYJJ_J7TZYmS4_wg$IDiEtgoZT9MTbFah9QxWRGVmEGrT96TumEDHzQUNAmfl-RRtT84UG3o5GnJiNSnhTODddg8qPIBq_mdkXAOJbg'),
+  ('577', 'supervisor', 'scrypt$16384$8$1$9ukJuQX0LzaRcSZJLJX6YA$eN5lCwu4_Oj1uEDiO4WXj2dY24UCX_bn9kOJR7sPRaP2y9Aot-9iZiCb9S2EMPHnzHzFGsHPbYW8wq4nRreLHg'),
+  ('1052', 'vendedor', 'scrypt$16384$8$1$V_60xFxDgwl-iVIArAX0mg$Cq8jORRIlEJj49RmXHVtOZ6sMd-_UNIs3X8MGTF198O8e3ylA-ivjETEhSw8JNhRSg_Ng76HOxKnA17t6IgR4w'),
+  ('1205', 'vendedor', 'scrypt$16384$8$1$yEaqE8ifPgdd2Batmqk7SA$nEFupIXScQ_jzkCFdLUq5rPCa3v4D_jddYjMXiphSvqx_oyk3kK9AX_Fi7Mt8C-ZzWvJ3yoje85CkQx-4Tiu6g'),
+  ('1220', 'vendedor', 'scrypt$16384$8$1$MnCwIvndYfGXhb2aMPXk1Q$046t3tPBwlvxUxZPpPlJMEaRmFfzjvsNl3xF9Km0Q4sf1VS_BDFreLkOu1wIXutZRTD_KIeUsG-ATbBudn9U-w'),
+  ('1260', 'vendedor', 'scrypt$16384$8$1$nvYgaF6H9f0vdZY0jgVeQA$2CGvo6T6TZr4HJO3_wOt7Oq4em2wATG6-p62EvPssidzdSwd_QHDER80STwSsSh0JCo4UCXBZfBVDYkRYHCRQA'),
+  ('1268', 'vendedor', 'scrypt$16384$8$1$0nRKfnRrkK5bl7QDOwFHEA$gctVWwZG9W0tpT62J3hDDZP5KLgQGvhlNlqAPvo4L6KlVqeFGrgal_hpAGZro4g7rZ8NxcJo188lIrWoCbO4Fw'),
+  ('1270', 'vendedor', 'scrypt$16384$8$1$2U87xcXVboG5o1jsRxdLSA$ROE3iPQP3ixsSyIcoxsRy4dHN3zA1mGu9Voznrdgrn9mHGll7s0gLVKcwddFzoPOXbJFX7G1BJdCzU7VPMYWcg'),
+  ('1308', 'vendedor', 'scrypt$16384$8$1$2Ge51OV02zUVqpmvtOI5wQ$tSMeeVcPNFr7l68MGBdWmbCjfwZrCWNXoPmMLYD_vIrmRrpo6FR3cNQHnvLFmMkmwMN4LMhlRoTfOg8kptDybw'),
+  ('1311', 'vendedor', 'scrypt$16384$8$1$WXdBXlazbMG1-V3zqMPmdw$JCNnQbpZgx-HVwu6osn3aEpQMDCHzjzwrQadmjUZJukkmbCAYu0HOqA1o2v5N0lZQUAzfudFUotpM2L-84829w'),
+  ('1312', 'vendedor', 'scrypt$16384$8$1$1OhJXdwhZH40HrUeZisoaQ$SXnMSy-jZxmD0wMTFNUpXPC4cR-HWfekdWv8YiCmTJL2iFHnI5ZhKNh0_vnkzyNzqCg3k4xUu5Qcl8z5Vo8yKg'),
+  ('1319', 'vendedor', 'scrypt$16384$8$1$cJroyEFEEC3Elf1kewbYyA$TiaWGI2TvirO0_8ua9Z1xEkN-sP94yOrob49ryD2CFuS9OqM-DOv3BPZP0nJxKgEL4kBJobOEsFY-F6PGQIKOg'),
+  ('1325', 'vendedor', 'scrypt$16384$8$1$ufJ5Q-kEhMF-T0v0JVUUAw$HN5JteBTQ2Q04srznnhgwQdTjzsMo1kJcI21Bmn-47yO_jxmujEOvqNzxUOirQQFCD-OoJ85myvuwULucMTFGQ'),
+  ('1267', 'vendedor', 'scrypt$16384$8$1$X40ltLP34vb-SouHSXiA9A$2Jw2eBFFbCh4p5N5RyO3kc6dZMzRIuA2K5RkjKIAjmKB0E-J-lWwoLQk_5rfQSIvTWvKen2l2TKTjAMxPRr98A'),
+  ('40', 'supervisor', 'scrypt$16384$8$1$TuYXNzMX-gb3HFNn8ZjXig$auTZRFDJW9HX5tUk0lGWNm02cm3CECdxWYklu3ok7CZ08cWOVZmKcq_-VSijI4KbRfJcDFK0QVR2foCE5L2KCg'),
+  ('768', 'vendedor', 'scrypt$16384$8$1$ZGEQ4qlLCztie40nGcIASA$5bp8EYVtXVrdUGI5rwbfitpQKZFjhEctxcq9Sl4S5fuLWTd_uqldwms-UgGRAPEhXh5FO_dmwlIwDDGFRRN74Q'),
+  ('1228', 'vendedor', 'scrypt$16384$8$1$t4VjwmKG2G_WOy5HCRpD1w$aJbuj5WRKr8h-nB2Itrg4CkBQp_dUTfE9EUH2nMWRsZQ5h-M0TzHy300yGWz7K0WalagzE-N0MS6dvsL5hNLog'),
+  ('1245', 'vendedor', 'scrypt$16384$8$1$hudvzeMGRGaxLWnKw2kW3w$j3mizTtabcrlqmTfPcTQ66cpd1uzktla09UUh68_wDER93B7_nyaJbZSBKYMqJ-nqVQfRLjntl56tUhd6SaugA'),
+  ('1249', 'vendedor', 'scrypt$16384$8$1$ENfZOtaVqi2UL5qyJxK-Ug$uDTnAdORQz20ZQx3eW7ecsgAZBmzvS4HRabIfhSMX5bR6IDxkJnGIWMvEFlB9aQfRunz_2cfe578kabUv7_vEA'),
+  ('1283', 'vendedor', 'scrypt$16384$8$1$jfCLuoB5-WGGc-Qmr5gryQ$pXkM31SXCxO1WBSTdc7mTK7sBNdoMLIRqffKOZnHF9-qqiTgMr4UscYj8LjrTj1WoNgMkaAxZpshEaT7G6KYXQ'),
+  ('1317', 'vendedor', 'scrypt$16384$8$1$Yohx_dSeJ9PG6JTjIJ7gFA$oC4uZqQwd18xGaDLH5oqvWRdZWJd9dmdRYMUW3Dis3zSoJrtWSl0m0Iz-fgHPXCVEganb1ERFl53ScytGgYfNQ'),
+  ('1320', 'vendedor', 'scrypt$16384$8$1$MMRX-n5CGBPBJR6TifPuHg$PQwX4PWVf4S5ekF857FbN6Au4QOHIjm0ot4pj5IbdY80GIjJlIAC2nWzov9Bio9LSGr-Il4PPE5JTEnPWZCI5w'),
+  ('1323', 'vendedor', 'scrypt$16384$8$1$BSvqcGY_YUVOtTiZo1IEgw$DVgkiY7GVfM4OFNg9dVL6V-XF50qWEQsQH1erunc2SBatg3n8GzSm3Zc_VCi-rF8sH3zQAf_kG2TiO4Sjv1gPQ'),
+  ('1324', 'vendedor', 'scrypt$16384$8$1$oC6tQZ88KymJoiUss6SvTA$nN8D1BccqySAbycmr27EWOOTTY6kWJAWnF5Kz6GqRuOJlEuhIZDq9ytyB6BBScSvY4CfiEoS3qo2ZTuh2PG8TA'),
+  ('1232', 'vendedor', 'scrypt$16384$8$1$BQ2-rzXrdkU48qq53Dcl8A$JlCYQ0HvFlFrYxxNcaaz8kCAK9F2WNWkcoIS3VRojaZzBYK6JnwYprrMMP43mYVN7wNF0oyAT6PWhlq7kEva_w'),
+  ('50', 'supervisor', 'scrypt$16384$8$1$e6wRxi9guwlVJz0VfJMKiw$8GLcB87udo4ho5w8SUsEdVdLn39wE-OCvCYnE5NyvmRxsHCSTrVYyj05sBjcx0YJOqk0mx9IL1fHSETW_JOV_A'),
+  ('1157', 'vendedor', 'scrypt$16384$8$1$-V8O8fu9SKVNi0iqMFeHlA$xNEOVAbanBcXQ-TapFDeyDHDhyVA2-xrnaif5xK79eAgdESVCbdfUAVI6amkbuQKphKYIF0pFHymr-FVObwuXQ'),
+  ('1160', 'vendedor', 'scrypt$16384$8$1$ogyqODZyQhR3pQ6csuphzw$v4h_lClyYv-PGbgFSj_4OKsL3k6Hg39b8ijVDx105PfQ2DMce6cc7uvmxO6CKRhq7SEq66-fJzm5AjrHzdCY8g'),
+  ('1248', 'vendedor', 'scrypt$16384$8$1$dUyNGcm73Yb3nYtgDetADg$nkRoNUmDjwoY6FSYMoLZPAfqQ-F1ShYEHxB5bD6JhvGMuksdi2GdfXw33QedaQvnxQol7gvtlLS5w-lDn-jh1Q'),
+  ('1258', 'vendedor', 'scrypt$16384$8$1$xid6eWDJDtFv9cuiiV05AQ$z3O-YRJdmNvVs4-2jbDbpNyFXGU7A9nE9xpenclsYU1T7cA9MU6uSiogLN80VwZMbYbr5FH2xVhLktOre7kJ9w'),
+  ('1262', 'vendedor', 'scrypt$16384$8$1$juh48Ns3Xn58wZaTbKYU3w$GKG5DsBAoLeBj3ikED36M8HGBDhk-ph9G5JV-7HMmc0Qk7CMgoLV2hFp3QycPbOu7UnMzLEAuLwAmjod57DvJQ'),
+  ('1263', 'vendedor', 'scrypt$16384$8$1$9jX-4_wpVm_zy7O6TRJMyg$h7U0XA7PAfLU-wSguW7jdeg0RfYZqQEthFESo3yxxiyZDTDATqWwasotc8YXQedvAjvMaU9XqZCgRNeSuFrrnw'),
+  ('1264', 'vendedor', 'scrypt$16384$8$1$WCpO0Kh-B0YLaM0B4SWCVA$Yv6sVud55EqCc4Z3PY8HCfJq5CsfK2-7X5v8CBU5PFPtvpxXow61fM744Vac82Qd9dSk3_FJL_a_Akc8frkfqQ'),
+  ('1280', 'vendedor', 'scrypt$16384$8$1$SePNB6H8E8qcyLfBeHKweA$1-wiLRYNQmuOSNiGv5YlF0zQBt4HumkN0RK3rnMDLugENGk96ErZAHtSE9B4-XyhFPyKgsX2lzglY84ER6hLdA'),
+  ('1307', 'vendedor', 'scrypt$16384$8$1$9j_U2Gsc5N2pY2vafbRPrQ$RVGqinJaXP9JLWvKuQWOnfPPzL7Si2EqdsIlMQuX1H7Vicn3M7NsW0vdgd1t4ZVoyE8wEpqEATlSgfr0d2O9_A'),
+  ('1314', 'vendedor', 'scrypt$16384$8$1$uACVfzrIgGLp8rUkU6Rm9g$wFzGF8isC3mKmOd--Nnq6tCxnQjDDYUCoE0n76q0Shb1zqwfqyxZwvstEJ0ORiA6irCHG-DY0FDne62HthP8aA'),
+  ('1297', 'vendedor', 'scrypt$16384$8$1$v5OfyemEayy3TRSMMdP7TA$j4GFUr7NKFUIttb_SoN7Z5j1hGqBnl8rGndhhKYO1si-cEDNJVooAexUcVECpyrGufH_ID1l954nrv5FwmHbyg'),
+  ('60', 'supervisor', 'scrypt$16384$8$1$chU-GFIXl3CK20ASQ7l5SQ$oLAlVcmnyJCq6Iw1HTOzwGag04-eq3oh8r1SjK_Df4PW6Src5dx3LXM6AGK5KXimQZMbZ0ouQLzul8rgtRUJ_g'),
+  ('1284', 'vendedor', 'scrypt$16384$8$1$uVCWfXHXLZcJs2IGW2MLgg$1zxlciZ9_wgcsUPwOUAbj7wVHFoKtgDO6ugeIRdF6CDRzDUhyEWOJMB5SRWKRxAPZCLzz-VTkOJbLNjjRugqcQ'),
+  ('1274', 'vendedor', 'scrypt$16384$8$1$t6VyelIuoGVwRPUY4FfF0Q$usuA0iilvi0myh_RURD9dWJUTF8WsZ6RIJpQ_8hS6Z9jeQEf8rlfhcHqQts1sBQ5lwDRrmOp8PjSRIAZB7JRpA'),
+  ('1275', 'vendedor', 'scrypt$16384$8$1$a7w-PWTn_vcehxZWxQfknw$WXO0Tsvam0_CefRRtoh7v00Bogq_umPYKj7u5o4g5pFMj-joFWEEvJhUZlADIxb9yAlT4vkHotk-X0Hw7003aA'),
+  ('1276', 'vendedor', 'scrypt$16384$8$1$baGtx6C2LxHilfVHHwHpEg$5surFcmBCTcERHRltAOJl1uslg1foVS52PGxmuAaPzfmXt8_iV0vYar4UZDWsiOkkFpDaP9K1VFasUnF6hfEcg'),
+  ('1278', 'vendedor', 'scrypt$16384$8$1$nl1F6RUxtrD9JnaFpeLAMQ$qzOgYHAmbU01OPdbRW1sHkNPkWLgc_I9t7U0wTBVOUc4k87ZRqW-qVD6HQwQHkiRgwXvF2DptAsii3gik-V8Hg'),
+  ('1279', 'vendedor', 'scrypt$16384$8$1$SEgeoUfuD4qLDKDrmHtFxA$sZ6s59XRdNG3z06WDvw0SXI-BmzTp2fS0mTwZcdta3jZ1yJ3cQyO9TNWiDkVQ1cvxz0iDDiES6vHGI_mxZrcSg'),
+  ('1281', 'vendedor', 'scrypt$16384$8$1$Xmmq3GVcdM8Srt_GiStuUg$X0DHKA8J8NpXG_p64NdJ5n0IpVtQkswOxYB3QU-j820EX20nUZt7KNpueol2v6riYAt30109qspfdVdsDcwXdw'),
+  ('1303', 'vendedor', 'scrypt$16384$8$1$ZEyTwT_LVmUN1CKaLI2fQg$FZiStxwgcz0Hv3rx4Lfz8X6OhAzhS9cHuJNOWTGwv5ysdfDWjeCo9J4GPVT4zChGvz-ynfetWgvTUw6pj5Ff2A'),
+  ('1321', 'vendedor', 'scrypt$16384$8$1$4UF8pI-rqrd8L4DIp8KHTg$lkzQVvHZ-vch4fR3rs__SQpFwDAKmXJkbY8WKkuaO75vl_HTg5WRui_IJCFLQa6SS1WGFJJP6GjQqpd6T8Uq4A'),
+  ('1335', 'vendedor', 'scrypt$16384$8$1$aWx5IU_qeMBIAP9GNEzT1Q$u4npcbD93SOWr6QSjinNFHvxtMVibFiw7FuG2J-7WT42z_GgMNmp5mxCYtw2j7gadXNb-4A_tPiCWPqwHvVAuA'),
+  ('1336', 'vendedor', 'scrypt$16384$8$1$gxvEpVf2Y__HoYMG5xNV7A$U1D1n9lJM7YWbacs3h8u9pkrejpdvFIwgmFwjdib_apGFfi9d-NNVW13RlWUUl55ORSDZDY7yx8ljKhugwYMQA'),
+  ('1273', 'vendedor', 'scrypt$16384$8$1$bj0Lo5_izWMpIVUvsSQdjQ$lp2lzqBuHiORyR6E6x4x07Rre0saAWEia7Q5lDNJn4mCOSljCTLhZ-y_1365diHlXecM7qObv8qTchVwiKqtGA'),
+  ('935', 'supervisor', 'scrypt$16384$8$1$e8LYc3-bmzwj2Yng4h0ftA$VVoHlW7emaoczklyXP3_vfZ_Bv2ll79B2JfGDlYtATGslYmEOKV51MMfwewB24YH2Z3HbgRx2odYgwYPJiZbjw'),
+  ('1282', 'vendedor', 'scrypt$16384$8$1$BEW_hBm1OwQHmNEdRyWFQQ$cCKGUB_JM7yrk4Iz4mT0oNVO-rOtWD6Ezykuqtpv93k6C7SKx7iY2CFankfXC85wNaTrTEjMRAuZEdy5ZasBPw'),
+  ('1322', 'vendedor', 'scrypt$16384$8$1$S0CegtzCal2n6TR2WGkCWQ$L7wnfSqHKjgS9WRH5-hZ0HtyV0hMXvAYXFJAjD0_2O4tqVCGaedI-A-tRft4JxdNuNslQVmi5AiR-VmafbkyxQ'),
+  ('1334', 'vendedor', 'scrypt$16384$8$1$ubg4zqpCpWsIxkE8lnVnpA$CEmBzMV-iP7-murS7O7e0eTH3pfv9Khpkl2xSe-0rNzlaAT0RDodPBxrXBRLgCYi_FQhg2dhZrXGhv5PxSAV8g'),
+  ('1338', 'vendedor', 'scrypt$16384$8$1$qfsdPkA22cjIpfff9xP2lg$rU2B-6u5oQo_YcpuQSXNRYsVaYIlYgZ_xdg1zn3Co3ePcMJtKacheU5XOgTLYtKtBMRWCetwCzpyYe_tSa8JgQ'),
+  ('1337', 'vendedor', 'scrypt$16384$8$1$bb1ttqdOQaYeJd7IahYt7g$XXxvG70QL1gTgXsdahEXEEoWMMr8FjOg20l_dgZLpmAx5Dt-8jef1OCGkoXTNX55_xJhmH_x_nsYoIXTDLtkug'),
+  ('1330', 'supervisor', 'scrypt$16384$8$1$cyT4QRUZO6gyE7a3BVNZUQ$DoiNteFdygaZ4Vsbzh4johQ4FqYKzlOhRIZNqFE7BEYIsJQLh6CRphUg4X2XPUgmPXB6lYJ0Hd21qSWaBSPfKg'),
+  ('1298', 'vendedor', 'scrypt$16384$8$1$qYse8jb8a3Ry_8V4hk5AIA$WLkjz8npYv740H0sdQlPS5Go3U-HrfNrNgBlEp0Tz4tnRuTwvm4N37Paf8Y66xW33heT2B41d4OqOAmzlF6gGA'),
+  ('1300', 'vendedor', 'scrypt$16384$8$1$OHgaHyghq4H-hXdYw6b4sQ$mD30b9d7DMAsEbxHSIYyhMHgYb-Jf6pyDUIZgufRDhHoT2o7Uq3xBda3EUAyJFskQe7u_by-cv-EP9YArZjBaQ'),
+  ('1301', 'vendedor', 'scrypt$16384$8$1$YvkofH7Qw5s7WLG3Kg0iQQ$MYDxos7c7OFrRYofFpxR7riGDqHUZGxkcE_HRxSlqa1FQ55GXA9vl0z7zilplXtmwzPjXowRJhwWBX3DEElEaA'),
+  ('1302', 'vendedor', 'scrypt$16384$8$1$nBN0163LXoBeu75MmA6Vzg$3W3g5OXyL_TsW3IAZ2mkugwi-_iuCkQczokIpcu8zyy_KBAbSdnYUtJNCHmDf6xQ1_KLb3j_XkI5M9XSJnqLPg'),
+  ('1304', 'vendedor', 'scrypt$16384$8$1$H5iTVZxCSX-AMmf3RXO9wg$Cc6lgIUvRL_01iZtKJM58gn70G_gWzX1hQ_aZq0El6CHQSIuLSQpVDyZ1Ufe045uQih2h7XotU_FVN3cyBi7kw'),
+  ('1313', 'vendedor', 'scrypt$16384$8$1$kaSltD3ZhD6LJ5eKwD-jTg$Xyy6VcRfMEEt1CNTEIDqXG23w21wpXqfxoO0_XsdMR9KxT807oL9j-P0j3mwPKM7rC3V4SJSdnD0zN82yHURlw'),
+  ('1339', 'vendedor', 'scrypt$16384$8$1$RCfsz6kA8c0kF2N8-2xOiQ$d9LHwWNC3ji3VgIB1nzZ72J8sgffJ9t6PiwdQh_fii2WUlJ2BHqQlb98LUe1rnKkz0rZfi-j7uY90bf4nDnntw'),
+  ('1340', 'vendedor', 'scrypt$16384$8$1$wBGqInecngQus6NP0yUHmw$pZxXf_dfNVBqk3ulUPL-9esfP7qLk_tWccIWxDwaUzPAXJ7jEm0qgmPEYCJ2wM9GcCaP5GbhbUKF1NfbXF11iw'),
+  ('1344', 'vendedor', 'scrypt$16384$8$1$JJm3FCoAjW5_1N1thKfsrg$Z__R_9-dcunBku7wepujDJ3THjPbKzCmoBnZ-qz53ZaZ2tkZ2JBFM7CTMBeM7JX0qJJ-Al5756LcGnMDPEQU0Q'),
+  ('1296', 'supervisor', 'scrypt$16384$8$1$4OUbBPt0iW1Xgzkqek95ag$t7pzw-ZnZo19XENE88f5R1cylVODb0RvHfbE9CB06w2u_4eIIVh03G0EZMLiJSfCDtcK3rSxETKjMXltLyCt2g'),
+  ('1341', 'vendedor', 'scrypt$16384$8$1$3yCNMypvPvLumqnx_-g4jQ$IYdGXOMKhV2_VwKE9kKQB20-j91P-5Rbnu5w-3fQ15vNjucQtINu1Ym7Zmq5sQK8s8EPSdKsazJ1eaffAM0oKQ'),
+  ('1289', 'vendedor', 'scrypt$16384$8$1$bMeWnxSKX4wZE8vvgobSbg$UHEfwQocv7eI-8GdTcbVPRDKNAsTipdOqfB7t3uuI32_3fPL8Hix5MqXzdwAR3aXqpeJJ4fwdlVr7toYO7pgVA'),
+  ('1292', 'vendedor', 'scrypt$16384$8$1$OhPyULLd66SLfDP2qcg3QA$-zR3gcbYCEl3F438_QtoGgWzHsFn_NDV9EZvRqCdmkEDalKWd9BcU1F7z6z_2rBTV12lsk6yUkBA-DWXuyZZxA'),
+  ('1294', 'vendedor', 'scrypt$16384$8$1$qoRZb0UfZIQm7cLDu-7r5g$G0mIFjrjPQj7qlG1-C8ZqkuVYjFZc0PiG6sXKvKto_CVO6eEPUiI9Bxts15KI42N3uWIYoGR_7CvO44RT-DzUw'),
+  ('1305', 'vendedor', 'scrypt$16384$8$1$Yf_kv4IEGARZilVbocu5lA$Vt592dSkWZw9fdePdlfcDzDtdlIujL0qYlig7_7djCu4HJVlWw2d2C6SowUwX2PvZEHFlO_heDc9cIQqfiKMxQ'),
+  ('1287', 'vendedor', 'scrypt$16384$8$1$QYV_Mowgbj3oBU3nuuuvdg$ia2o4V8p-KaksMz0XSHhsfSKPBOErqW3ev00HPDyHrwu_pMxjtb826ZXq-x-vmnJ7mSZWQe9PglH5M-4QiIUkA'),
+  ('638', 'supervisor', 'scrypt$16384$8$1$xct4G40wtg5rf5Vo0oiAJA$0HStSOJk3LkYqqJ43M61F1BWRv76g_vcD9OZYZh4pJhusA4Ny8cOxt06zcKLK6Bw5OJn1BTMj9WE3-vHZ91pvw'),
+  ('1290', 'vendedor', 'scrypt$16384$8$1$wZX3PA81vXLtFWZZ4FwJoA$bhflWqDsQPa8F3J7KY7QUsyrVart11aaZzMSGrLi3f6UfHpfyUZZrwWkd1qmDRc4fuKisPqNKMyICnYToNOPdQ'),
+  ('1291', 'vendedor', 'scrypt$16384$8$1$a4Fc8hPXc7Cf-YnIg14dOw$uWWQ_f_bmLOiFXdfTijrtLruA6RExLt2pjPpzGbObSc14-_rpPd_-jRSKQdLRoaKH2mi7RB9szPTgcKMOnzYDg'),
+  ('1293', 'vendedor', 'scrypt$16384$8$1$kzE9Wb1GnaH9E0_y7c0YkA$t8CgMZiGRyhdzhVRZF1uCCUplwuYKXmySUxu6vAj8SOiAOvOKw9GRM92FcArnzd_WjTjCzJrdcdt1HNhXTPOtA'),
+  ('1343', 'vendedor', 'scrypt$16384$8$1$yi5pTvaeeQHhjYhcgCbtWg$REKqg8yJckXf89bpMKMw6YBHZAmB_77KlcxPD34nDvlZm2U9lvWqk7r_v5wCkGvT1sIgnyiNnvXTg801fyUQ2g'),
+  ('1329', 'vendedor', 'scrypt$16384$8$1$fNWbziG-0l7IPlC1gf29hA$jc_QRE8F_B_1tDNoRpEUVumPBvTszt0K-OxP6yAVMoazCA5PjbmJAzH7dzb8HRhLSK92n-Z8ThpQNhnLuMgUgA'),
+  ('1501', 'supervisor', 'scrypt$16384$8$1$d_R9hdG2lCcySSGqYrBsDA$cHZUS07myQqvsugniDMhBSSwOzG-7zfwwfhVuywrofBDuwK4SjFV5aEvrWJRvHTNrCNVR3DnHpzeEtuclHlCNA'),
+  ('1295', 'vendedor', 'scrypt$16384$8$1$dzg3zE0aFR3pjSToYdv2RA$pp32va7GUKrRTIHNZ4j4czmH1GfYk_xAq-OY83MlPeNUCYtAQIaYmJ9e6UgpKqRL-rjFnJx5J3r46BNrSvA4rQ'),
+  ('gerencia', 'gerencia', 'scrypt$16384$8$1$eRpV0LOcB5dOPS9Lk_QVYw$OXjoiB8sJc_xpFh0KgZks1hutMvbRyxHE2NlhX-yaeTuzFkpKqu6Xfb1_Jc1bz_AJBNWEOM0hQr6F4pQoZ-dHw'),
+  ('1346', 'vendedor', 'scrypt$16384$8$1$hz2trjUVX44GUlbcYK2hzA$WZ2z60jVMJ63ivOko3A8SLi0Tldy71ti0cKtyRmddYg6kkUojydcnTykJxd7vtpx3O5a-4VQDIOgbT1l1h5QCA'),
+  ('marketing', 'gerencia', 'scrypt$16384$8$1$d4XUruzr4I2Sa09Qn3hg4Q$NkCEjlPpMsijOuKGrOBt8SmM9H2cqvtRsV3Zj2tiziKh2aeE0DqvNjtsRYwyBQZJQ3wbJMWtvRMBFD5iZJ3HNA'),
+  ('lays', 'gerencia', 'scrypt$16384$8$1$nqKlguIBpGftE2ALw26-RA$WqSePj_TNHXOyyTv3PaJYkr7GxOLUcwd6KD1LHWYMxlPWhQbMTTuIuRg5_Y20kMccT8VptrWqeFLcBaCiQj_Jg'),
+  ('cassia', 'gerencia', 'scrypt$16384$8$1$qjEw9RMeRqNC83Ur9og8XA$bhhajhH9EjA8JWJqGOsYrieTtMK97PAW-XolKcFPbohuxaEwZzXe-e0GjStEn596cGwa-HQdcsaeTfpnIVzbFA'),
+  ('gabi', 'gerencia', 'scrypt$16384$8$1$fGGQMPKz_Gwcb2wZfhj5iw$4GdUynYA9AGhoM-ECi7pNPT1-_d5038j2SYFx0byfTLf4M2oHDLHcEj_3hnVrkYLsUO546mB9UUjJ-RkfUNtmA'),
+  ('mvitoria', 'gerencia', 'scrypt$16384$8$1$sOHMu4lP5-IAWhh928oFsg$xAf4GqZYFMr13AnnetnKtap3NJrAAdCrvgNHtM8KmufaXxJdd5aOgdjUO51lbocE8iXHEF4Nxayk2KXjyPM3Xg'),
+  ('vitoria', 'gerencia', 'scrypt$16384$8$1$DxBE9Q7rE21KvL2XKoN_aA$unMwfEnB7rUv6np1ygN2FXbvC2Y0QAltMUemdjgtmy6512RMT5un0niUKcddhtEahxYaAogEfnXrvcvIKduxcQ'),
+  ('Felipe', 'gerencia', 'scrypt$16384$8$1$5AkCgLZxxupqQqMxEsQaUw$4VjNLL-i84fEqLlOPaEv_1L9kyUuhsGsJuVlAJLAMrzrVhENvh8qoTgx14Ph9ccNbt0uniEKCpxMGY78m5rz2A'),
+  ('LuisFelipe', 'gerencia', 'scrypt$16384$8$1$3A0DHZZIfTNZ3lAVyzr0pw$pinmHTlC8utAA4c2rrncnToqGZw3-v-ZosStjxbfoFaRigRVxG0TkFx0vSz2I2qREBfAGTckoM0wa-EGDHi5aQ'),
+  ('logistica', 'gerencia', 'scrypt$16384$8$1$LVHemjkZXMEX5_A2ZktIGg$OngiE_POatfQD28D6w8Cc0p7xJL9BuCF6zV00Yezrhu37Qlq20afXdlP0oDg5zxnxr4W-xbp6rZGKjiJVqnnxg'),
+  ('taci', 'gerencia', 'scrypt$16384$8$1$trGbmP2xEzqT0ZwuDOabBQ$2qGps1AxgCmrRGnt0JZOihgmn-YRq7Ymvm3wDxDiKRHZRC7lvRO4ekU2bjhXzxI6bSqzRPtxNwJiN3REYKyt8A'),
+  ('RafaelG', 'gerencia', 'scrypt$16384$8$1$UUkAS1oQjR_gByy8tdMcMg$VG5MGBmjr-iW8VATKfl5pTa4uzDISbFbOVrH2Y1crdr7OnAUN1Y36W4nTcLr_khLrBlbOSnmJBUl9Etkd-OGMw'),
+  ('BiaG', 'gerencia', 'scrypt$16384$8$1$V-b573eQzzVLUiXkkHmNcw$FipNt-J-aOj28lLT30ytIS-jjEaVSWdS6vOwBxAyVQkchA7ZdsxCz2Qw1VdBQzDyexhQXKvk0zlwwFkUgqho1w'),
+  ('70', 'supervisor', 'scrypt$16384$8$1$Ic70S5tN0BMWq_izyC4urw$jHbWvG9QdxPf3XFOB9sEJt4IZZbuWy7tsoxJNxNrIjNuHZr4WZk3KOZkNEdyN6BpYTUrGJaLisZL93ysFTsqTA'),
+  ('admin', 'admin', 'scrypt$16384$8$1$AmJTIATjP8jpA0asvVetLA$bkKsH2iQS_mMzW0cSpYIjsA9iCH3fXOl6f92jd4FqNBsjGac0lP4dvGalpq6fcm1gtM0-1_2UVCOc92xi31XIg');
+
+COMMIT;
+
+SELECT perfil, COUNT(*) AS total FROM public.usuarios GROUP BY perfil ORDER BY perfil;
