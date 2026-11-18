@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { getSessionUserFromRequest } from '@/lib/session'
+import { limparArquivosAntigos } from '@/lib/storage-cleanup'
 
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -54,6 +55,9 @@ export async function POST(request: NextRequest) {
       .from('excel-files')
       .remove([storagePath])
     // Ignoramos erros aqui - se o arquivo não existir, não há problema
+
+    // Remove também arquivos antigos/legados, mantendo só a última importação
+    await limparArquivosAntigos(supabaseAdmin)
 
     const { data, error } = await supabaseAdmin.storage
       .from('excel-files')

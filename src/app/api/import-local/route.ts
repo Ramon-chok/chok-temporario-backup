@@ -417,62 +417,22 @@ export async function POST() {
       )
     }
 
-    const incomingPedidoIds = Array.from(
-      new Set(cleanRegistrosFaturamento.map((pedido) => String(pedido.nu_ped)))
-    )
+    // Mantém apenas a última importação: limpa tudo antes de inserir.
+    // (Evita o limite de 1000 linhas do select e o acúmulo de pedidos antigos.)
+    const { error: itensDeleteError } = await supabase
+      .from('it_pedv')
+      .delete()
+      .gte('nu_ped', 0)
+    if (itensDeleteError) {
+      throw new Error(`Erro ao limpar itens antigos (it_pedv): ${itensDeleteError.message}`)
+    }
 
-    const { data: existingPedidosData, error: existingPedidosError } = await supabase
+    const { error: pedidosDeleteError } = await supabase
       .from('ped_vda')
-      .select('nu_ped')
-
-    if (existingPedidosError) {
-      throw new Error(`Erro ao buscar pedidos existentes: ${existingPedidosError.message}`)
-    }
-
-    const existingPedidoIds = new Set(
-      (existingPedidosData || []).map((row) => String(row.nu_ped))
-    )
-
-    const idsToDeleteOnly = Array.from(existingPedidoIds).filter(
-      (pedidoId) => !incomingPedidoIds.includes(pedidoId)
-    )
-
-    // Remove pedidos que sumiram do arquivo atual.
-    for (const loteIds of chunkArray(idsToDeleteOnly, 500)) {
-      const { error: itensDeleteError } = await supabase
-        .from('it_pedv')
-        .delete()
-        .in('nu_ped', loteIds)
-      if (itensDeleteError) {
-        throw new Error(`Erro ao remover itens antigos (it_pedv): ${itensDeleteError.message}`)
-      }
-
-      const { error: pedidosDeleteError } = await supabase
-        .from('ped_vda')
-        .delete()
-        .in('nu_ped', loteIds)
-      if (pedidosDeleteError) {
-        throw new Error(`Erro ao remover pedidos antigos (ped_vda): ${pedidosDeleteError.message}`)
-      }
-    }
-
-    // Reposição segmentada: remove e reinsere apenas os pedidos presentes no arquivo atual.
-    for (const loteIds of chunkArray(incomingPedidoIds, 500)) {
-      const { error: itensDeleteError } = await supabase
-        .from('it_pedv')
-        .delete()
-        .in('nu_ped', loteIds)
-      if (itensDeleteError) {
-        throw new Error(`Erro ao substituir itens (it_pedv): ${itensDeleteError.message}`)
-      }
-
-      const { error: pedidosDeleteError } = await supabase
-        .from('ped_vda')
-        .delete()
-        .in('nu_ped', loteIds)
-      if (pedidosDeleteError) {
-        throw new Error(`Erro ao substituir pedidos (ped_vda): ${pedidosDeleteError.message}`)
-      }
+      .delete()
+      .gte('nu_ped', 0)
+    if (pedidosDeleteError) {
+      throw new Error(`Erro ao limpar pedidos antigos (ped_vda): ${pedidosDeleteError.message}`)
     }
 
     // Inserir pedidos em lotes para evitar payloads muito grandes.

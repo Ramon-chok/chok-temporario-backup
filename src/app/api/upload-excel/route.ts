@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { getSessionUserFromRequest } from '@/lib/session'
+import { limparArquivosAntigos } from '@/lib/storage-cleanup'
 
 // Cliente Supabase com privilégios admin
 const supabaseAdmin = createClient(
@@ -89,6 +90,9 @@ export async function POST(request: NextRequest) {
         { status: 500 }
       )
     }
+
+    // Mantém no Supabase apenas a última importação
+    await limparArquivosAntigos(supabaseAdmin)
 
     console.log(`[UPLOAD] Arquivo enviado com sucesso: ${file.name} (${buffer.length} bytes) -> ${supabaseFileName}`)
 

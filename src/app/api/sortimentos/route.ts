@@ -85,6 +85,12 @@ async function resolveStorageWorkbookPath(): Promise<{ tmpPath: string; updatedA
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true })
     }
+    // Remove cópias temporárias anteriores para não acumular em /tmp
+    for (const name of fs.readdirSync(tmpDir)) {
+      if (/^sortimentos_\d+\.xlsx?m?$/.test(name)) {
+        try { fs.unlinkSync(`${tmpDir}/${name}`) } catch { /* ignora */ }
+      }
+    }
     fs.writeFileSync(tmpPath, bytes)
 
     return { tmpPath, updatedAt, storageName }
